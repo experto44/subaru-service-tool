@@ -130,6 +130,7 @@ object ObdPids {
     val RADIATOR_FAN = ObdPid(
         cmd = "2210E3", name = "Radiator Fan Control", unit = "%",
         minVal = 0f, maxVal = 100f, group = PidGroup.MISC,
+        header = "7E0",
     ) { b -> if (b.isNotEmpty()) b[0].toFloat() else null }
 
     // Feedback Knock Correction — turbo engines only
@@ -182,6 +183,7 @@ object ObdPids {
     val FUEL_PUMP = ObdPid(
         cmd = "2210B3", name = "Fuel Pump Duty", unit = "%",
         minVal = 0f, maxVal = 100f, group = PidGroup.FUEL,
+        header = "7E0",
     ) { b -> if (b.isNotEmpty()) b[0].toFloat() * 100f / 255f else null }
 
     // VVT advance angles — SSM A8, equation: A × 0.5 (signed, 0x80 = 0°)

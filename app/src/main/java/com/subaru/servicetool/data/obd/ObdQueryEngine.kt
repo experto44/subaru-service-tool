@@ -213,21 +213,7 @@ class ObdQueryEngine @Inject constructor(
                     "ecuSupported=${snapshot.ecuStates.values.count { it == CapabilityState.SUPPORTED }} " +
                     "tcuSupported=${snapshot.tcuStates.values.count { it == CapabilityState.SUPPORTED }}")
 
-                // 3. Module discovery — sequential before pollers (header isolation)
-                Log.i(TAG, "[DISCOVERY] Running module discovery")
-                val t3 = System.currentTimeMillis()
-                try {
-                    val modules = moduleDiscovery.discover()
-                    // Feed discovered addresses into the extensible PID registry so the framework
-                    // reflects what the ECU actually exposes (ActiveOBD discover-then-read model).
-                    val added = dynamicRegistrar.registerDiscovered(modules)
-                    Log.i(TAG, "[DISCOVERY] Done in ${System.currentTimeMillis() - t3}ms — " +
-                        "$added dynamic PIDs registered (registry total=${pidRegistry.size})")
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.e(TAG, "[DISCOVERY] Failed (${e.message}) — pollers start anyway")
-                }
+                // Module discovery moved into supervisorScope to run concurrently with pollers.
             } else {
                 // ── Reconnect: skip expensive setup, reuse caches ────────────
                 val snapshot = cachedSnapshot!!
@@ -251,6 +237,24 @@ class ObdQueryEngine @Inject constructor(
 
             // supervisorScope: child failures are isolated; cancelled when pollJob is cancelled.
             supervisorScope {
+                if (!isReconnect) {
+                    launch {
+                        Log.i(TAG, "[DISCOVERY] Running module discovery in background")
+                        val t3 = System.currentTimeMillis()
+                        try {
+                            // Discovery uses the moduleHeaderMutex to play nice with other pollers.
+                            val modules = moduleDiscovery.discover(moduleHeaderMutex)
+                            val added = dynamicRegistrar.registerDiscovered(modules)
+                            Log.i(TAG, "[DISCOVERY] Done in ${System.currentTimeMillis() - t3}ms — " +
+                                "$added dynamic PIDs registered")
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.e(TAG, "[DISCOVERY] Background discovery failed: ${e.message}")
+                        }
+                    }
+                }
+
                 launch {
                     try {
                         enginePoller.run(snapshot, isTurbo, carPids)

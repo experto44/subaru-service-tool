@@ -49,14 +49,14 @@ private const val GATT_TIMEOUT_MS = 10_000L
 private const val MTU_SIZE = 512
 
 private val ELM327_INIT = listOf(
-    "ATZ\r"      to 1000L,
-    "ATE0\r"     to  300L,
-    "ATL0\r"     to  300L,
-    "ATH1\r"     to  300L,
-    "ATSP6\r"    to  300L,  // ISO 15765-4 CAN 11-bit 500 kbaud
-    "ATAT1\r"    to  300L,
-    "ATST FF\r"  to  300L,
-    "ATSH7E0\r"  to  300L,  // default to ECM header; restored after every non-ECM batch
+    "ATZ",
+    "ATE0",
+    "ATL0",
+    "ATH1",
+    "ATSP0",   // Automatic protocol detection (safer for multi-generation support)
+    "ATAT1",
+    "ATST FF",
+    "ATSH7E0", // default to ECM header; restored after every non-ECM batch
 )
 
 @Singleton
@@ -202,11 +202,18 @@ class OBDBluetoothManager @Inject constructor(
 
     /** Sends a command and waits up to [timeoutMs] for a '>' terminated response. Null on timeout. */
     suspend fun sendCommand(command: String, timeoutMs: Long = 5_000L): String? {
-        if (_state.value !is BluetoothConnectionState.Connected) return null
+        val state = _state.value
+        if (state !is BluetoothConnectionState.Connected && state !is BluetoothConnectionState.Connecting) {
+            return null
+        }
         return commandMutex.withLock {
+            // Drain any stale responses
+            while (cmdResponseChannel.tryReceive().isSuccess) { /* no-op */ }
+
             // Enforce minimum 15 ms between hardware writes
             val elapsed = System.currentTimeMillis() - lastWriteMs
             if (elapsed < 15L) delay(15L - elapsed)
+
             commandActive.set(true)
             bleBuffer.clear()
             try {
@@ -264,22 +271,25 @@ class OBDBluetoothManager @Inject constructor(
         // 5. Enable notifications on the notify characteristic
         enableNotifications(nChar)
 
-        // 6. ELM327 init sequence (fire-and-wait, no response needed)
-        for ((cmd, waitMs) in ELM327_INIT) {
-            writeBle(cmd)
-            delay(waitMs)
-        }
-
         val name = runCatching { device.name }.getOrNull() ?: device.address
-        _state.value = BluetoothConnectionState.Connected(name, OBDConnectionType.BLE)
-        reconnectAttempts = 0
-        Log.i(TAG, "BLE ready: $name")
-
-        startKeepAlive()
 
         try {
             coroutineScope {
                 val monitorJob = launch { monitorBleEvents() }
+
+                // 6. ELM327 init sequence (wait for responses for better synchronization)
+                for (cmd in ELM327_INIT) {
+                    val timeout = if (cmd == "ATZ") 2000L else 1000L
+                    val resp = sendCommand(cmd, timeout)
+                    Log.d(TAG, "ELM327 Init: $cmd → ${resp?.trim()}")
+                }
+
+                _state.value = BluetoothConnectionState.Connected(name, OBDConnectionType.BLE)
+                reconnectAttempts = 0
+                Log.i(TAG, "BLE ready: $name")
+
+                startKeepAlive()
+
                 delay(100)
                 runBenchmark()
                 monitorJob.join()
@@ -391,9 +401,14 @@ class OBDBluetoothManager @Inject constructor(
         }
         sppSocket = socket
 
-        for ((cmd, waitMs) in ELM327_INIT) {
-            writeSpp(cmd)
-            delay(waitMs)
+        // Start reading immediately so we can receive responses to init commands
+        val readJob = scope.launch { sppReadLoop(socket) }
+
+        // ELM327 init sequence
+        for (cmd in ELM327_INIT) {
+            val timeout = if (cmd == "ATZ") 2000L else 1000L
+            val resp = sendCommand(cmd, timeout)
+            Log.d(TAG, "ELM327 Init: $cmd → ${resp?.trim()}")
         }
 
         val name = runCatching { device.name }.getOrNull() ?: device.address
@@ -405,7 +420,6 @@ class OBDBluetoothManager @Inject constructor(
 
         try {
             coroutineScope {
-                val readJob = launch { sppReadLoop(socket) }
                 delay(100)
                 runBenchmark()
                 readJob.join()
@@ -610,14 +624,11 @@ class OBDBluetoothManager @Inject constructor(
     /** Re-sends the ELM327 init sequence after catastrophic timeout failure. */
     suspend fun reinitializeElm327() {
         if (_state.value !is BluetoothConnectionState.Connected) return
-        commandMutex.withLock {
-            bleBuffer.clear()
-            for ((cmd, waitMs) in ELM327_INIT) {
-                writeToAdapter(cmd)
-                delay(waitMs)
-            }
-            Log.i(TAG, "ELM327 reinitialized")
+        Log.i(TAG, "Reinitializing ELM327...")
+        for (cmd in ELM327_INIT) {
+            sendCommand(cmd, 1000L)
         }
+        Log.i(TAG, "ELM327 reinitialized")
     }
 
     fun downgradeProfile() {
