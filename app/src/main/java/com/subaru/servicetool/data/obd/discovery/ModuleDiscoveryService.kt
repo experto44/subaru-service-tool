@@ -5,6 +5,7 @@ import com.subaru.servicetool.data.bluetooth.OBDBluetoothManager
 import com.subaru.servicetool.data.obd.ObdCapabilityProber
 import com.subaru.servicetool.data.obd.ObdParser
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -261,36 +262,38 @@ class ModuleDiscoveryService @Inject constructor(
     /**
      * Runs a full module discovery sweep and updates [modules].
      *
-     * This function is sequential — it restores ATSH7E0 before returning.
-     * It must be called while no other component is sending BT commands.
-     * Typically called from [ObdQueryEngine] before the polling supervisor scope starts.
+     * This function is thread-safe via [moduleHeaderMutex] — it can run alongside
+     * pollers. It restores ATSH7E0 before returning.
      *
      * @return The complete module map after discovery.
      */
-    suspend fun discover(): Map<SubaruModule, ModuleInfo> {
+    suspend fun discover(moduleHeaderMutex: kotlinx.coroutines.sync.Mutex? = null): Map<SubaruModule, ModuleInfo> {
         Log.i(TAG, "════ MODULE DISCOVERY START ════")
         Log.i(TAG, "Probing ${SubaruModule.entries.size} module types — advisory only, pollers unaffected")
         _modules.value = emptyMap()
 
         val result = mutableMapOf<SubaruModule, ModuleInfo>()
 
+        // Use a local mutex if none provided (legacy path)
+        val mutex = moduleHeaderMutex ?: kotlinx.coroutines.sync.Mutex()
+
         // ECU — always attempted first (7E0 is already active after ELM init)
         result[SubaruModule.ECU] = discoverEcu()
 
         // TCU / CVT / AWD — all share header 7E1
-        val tcuResult = discoverTcu()
+        val tcuResult = mutex.withLock { discoverTcu() }
         result[SubaruModule.TCU] = tcuResult
         result[SubaruModule.CVT] = deriveCvt(tcuResult)
         result[SubaruModule.AWD] = deriveAwd(tcuResult)
 
         // TPMS — header 7D4, UDS DIDs
-        result[SubaruModule.TPMS] = discoverTpms()
+        result[SubaruModule.TPMS] = mutex.withLock { discoverTpms() }
 
         // Body Control Module — header 7E2
-        result[SubaruModule.BODY] = discoverBody()
+        result[SubaruModule.BODY] = mutex.withLock { discoverBody() }
 
         // Hybrid BMS — header 7E6
-        result[SubaruModule.HYBRID] = discoverHybrid()
+        result[SubaruModule.HYBRID] = mutex.withLock { discoverHybrid() }
 
         // Ensure default header is restored
         btManager.sendCommand("ATSH7E0", HEADER_TIMEOUT_MS)
